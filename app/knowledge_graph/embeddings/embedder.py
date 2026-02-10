@@ -1,28 +1,29 @@
-from __future__ import annotations
+from sentence_transformers import SentenceTransformer
 import math
-import hashlib
-from dataclasses import dataclass
 from typing import List
 
-@dataclass(frozen=True)
+_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+
 class Embedding:
-    values: List[float]
+    def __init__(self, values: List[float]):
+        self.values = values
 
-def _hash_to_vec(text: str, dim: int = 64) -> List[float]:
-    # Deterministic “good enough” embedding placeholder (no extra deps).
-    # Replace later with SentenceTransformers/OpenAI embeddings without changing interfaces.
-    h = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
-    vals = []
-    for i in range(dim):
-        b = h[i % len(h)]
-        vals.append((b / 255.0) * 2 - 1)
-    # normalize
-    norm = math.sqrt(sum(v*v for v in vals)) or 1.0
-    return [v / norm for v in vals]
 
-def embed_texts(texts: List[str], dim: int = 64) -> List[Embedding]:
-    return [Embedding(_hash_to_vec(t, dim=dim)) for t in texts]
+def embed_texts(texts: List[str]) -> List[Embedding]:
+    """
+    Convert list of texts into semantic embeddings
+    """
+    vectors = _model.encode(
+        texts,
+        normalize_embeddings=True,  # مهم جدًا
+        show_progress_bar=False
+    )
+    return [Embedding(values=v.tolist()) for v in vectors]
+
 
 def cosine(a: List[float], b: List[float]) -> float:
-    s = sum(x*y for x, y in zip(a, b))
-    return s
+    """
+    Cosine similarity between two vectors
+    """
+    return sum(x * y for x, y in zip(a, b))

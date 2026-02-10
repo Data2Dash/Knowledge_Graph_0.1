@@ -23,3 +23,4 @@ networkx>=3.2.0
 # Utilities
 json-repair>=0.7.0
 typing-extensions
+sentence-transformers>=2.2.2
