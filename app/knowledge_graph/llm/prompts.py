@@ -1,41 +1,34 @@
-# Schema + extraction instructions/prompts
+RESEARCH_PAPER_ENTITY_PROMPT = """\
+You extract ENTITIES from research papers.
+Return ONLY valid JSON array (no markdown).
+Each item:
+{"name": "...", "type": "...", "aliases": ["..."]}
 
-ALLOWED_NODES = [
-    "Concept", "Method", "Metric", "Dataset", "Result", "Challenge",
-    "Author", "Organization", "Hyperparameter", "Technique",
-    "Contribution", "Theory", "Process", "Task", "Baseline",
-    "Advantage", "Observation", "Limitation", "FutureWork",
-    "Model", "Component", "Benchmark", "Architecture", "Algorithm",
-    "Publication", "System"
-]
+Types must be one of:
+Concept, Method, Model, Dataset, Metric, Result, Baseline, Technique, Architecture,
+Task, Algorithm, Benchmark, Component, Observation, Limitation, Contribution,
+Author, Organization, Publication, System, Process, Theory, Hyperparameter
 
-ALLOWED_RELATIONSHIPS = [
-    "RELATED_TO", "USES", "CONTAINS", "COMPARED_TO", "ILLUSTRATES",
-    "TRAINED_ON", "COMPARED_TO_ON", "USED_FOR", "IMPLEMENTS", "EVALUATES",
-    "ACHIEVES", "ADDRESSES", "RESULTS_IN", "PART_OF", "CONTRIBUTES_TO",
-    "IMPROVES", "SUPPORTS", "DEPENDS_ON", "DESCRIBED_IN", "PROPOSES",
-    "OBSERVED_IN", "EXTENDS", "LIMITS", "INTRODUCES", "CITES"
-]
+Rules:
+- Prefer specific names (e.g., "BERT", "CIFAR-10", "BLEU", "LoRA").
+- Include aliases if present (acronyms).
+- Output 15-60 entities when possible.
+"""
 
-RESEARCH_PAPER_INSTRUCTIONS = (
-    "Extract ALL entities and relations. Cover every important detail: models, methods, datasets, metrics, "
-    "baselines, components, architectures, results, contributions, limitations, comparisons, authors, "
-    "algorithms, techniques, tasks, benchmarks, key findings, hyperparameters. "
-    "Output a JSON array. Each object: head, head_type, relation, tail, tail_type. "
-    "Example: [{\"head\":\"BERT\",\"head_type\":\"Model\",\"relation\":\"TRAINED_ON\",\"tail\":\"Wikipedia\",\"tail_type\":\"Dataset\"}]. "
-    "Extract 30-70 relations when possible. Output ONLY the JSON array."
-)
+RESEARCH_PAPER_RELATION_PROMPT = """\
+You extract RELATIONSHIPS from research papers using a provided entity list.
+Return ONLY valid JSON array (no markdown).
+Each item:
+{"head":"...", "head_type":"...", "relation":"...", "tail":"...", "tail_type":"...", "evidence":"..."}
 
-DIRECT_PROMPT = (
-    "Extract ALL entities and relations. Cover models, datasets, metrics, baselines, methods, components, "
-    "results, contributions, limitations, comparisons, authors, techniques.\n"
-    "Each object: {\"head\":\"entity1\",\"head_type\":\"Model\",\"relation\":\"USES\",\"tail\":\"entity2\",\"tail_type\":\"Component\"}\n"
-    "Node types: Model, Method, Dataset, Metric, Component, Concept, Author, Result, Baseline, Technique, "
-    "Architecture, Task, Algorithm, Benchmark, Observation, Limitation, Contribution.\n"
-    "Relation types: USES, CONTAINS, RELATED_TO, PART_OF, COMPARED_TO, TRAINED_ON, EVALUATES, IMPROVES, "
-    "IMPLEMENTS, ACHIEVES, ADDRESSES, RESULTS_IN, PROPOSES, EXTENDS, DEPENDS_ON, SUPPORTS, ILLUSTRATES, "
-    "CONTRIBUTES_TO, INTRODUCES, OBSERVED_IN, LIMITS, CITES.\n"
-    "Extract 20-40 relations. Output ONLY valid JSON array (no markdown)."
-)
+Allowed relations:
+RELATED_TO, USES, CONTAINS, PART_OF, COMPARED_TO, TRAINED_ON, EVALUATES, IMPROVES,
+IMPLEMENTS, ACHIEVES, ADDRESSES, RESULTS_IN, PROPOSES, EXTENDS, DEPENDS_ON,
+SUPPORTS, ILLUSTRATES, CONTRIBUTES_TO, INTRODUCES, OBSERVED_IN, LIMITS, CITES,
+DESCRIBED_IN
 
-
+Rules:
+- Use ONLY entities from the entity list (or obvious exact matches).
+- evidence must be a short quote (<= 25 words) copied from the text.
+- Output 20-70 relations when possible.
+"""

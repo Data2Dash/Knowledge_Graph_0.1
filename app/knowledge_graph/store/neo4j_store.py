@@ -1,17 +1,13 @@
 from __future__ import annotations
-import logging
-from typing import List
+from typing import List, Optional
 from langchain_community.graphs import Neo4jGraph
 from langchain_experimental.graph_transformers.llm import GraphDocument
 from app.core.config import PipelineConfig
 
-LOGGER = logging.getLogger("insightgraph")
-
-def sync_to_neo4j(graph_documents: List[GraphDocument], cfg: PipelineConfig) -> bool:
+def sync_graph_documents(cfg: PipelineConfig, graph_documents: List[GraphDocument]) -> bool:
     try:
-        graph = Neo4jGraph(url=cfg.neo4j_url, username=cfg.neo4j_user, password=cfg.neo4j_password)
-        graph.add_graph_documents(graph_documents)
+        g = Neo4jGraph(url=cfg.neo4j_url, username=cfg.neo4j_user, password=cfg.neo4j_password)
+        g.add_graph_documents(graph_documents)
         return True
-    except Exception as e:
-        LOGGER.warning("Neo4j Error: %s", e)
+    except Exception:
         return False

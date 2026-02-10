@@ -1,242 +1,241 @@
-# app/pipelines/graph_pipeline.py
 from __future__ import annotations
 
-import os
-import logging
-from typing import List, Tuple, Optional
+import asyncio
+import re
+from typing import Optional, Tuple, List, Dict, Callable, Awaitable
+
 from langchain_core.documents import Document
-from app.core.config import PipelineConfig
-
-# ✅ IMPORTANT: your module path has a typo "chunck_ranker"
-# Keep it if that's how your folder/file is named.
-from app.knowledge_graph.chunking.chunck_ranker import rank_chunks
-
-from app.knowledge_graph.llm.groq_client import build_llm
-from app.knowledge_graph.extraction.llm_extract import extract_entities, extract_relations
-from app.knowledge_graph.postprocess.cleaner import dedupe_entities, dedupe_relations
-
+from langchain_community.graphs.graph_document import Node, Relationship
 from langchain_experimental.graph_transformers.llm import GraphDocument
 
+from app.core.config import PipelineConfig
+from app.core.logging import setup_logging
+from app.knowledge_graph.llm.groq_client import build_llm
 
-LOGGER = logging.getLogger("insightgraph")
-if not LOGGER.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+from app.knowledge_graph.ingestion.pdf_loader import load_pdf_text
+from app.knowledge_graph.preprocessing.text_cleaner import (
+    preprocess_text,
+    split_by_sections,
+    sliding_window_chunks,
+    page_based_chunks,
+)
 
+from app.knowledge_graph.chunking.semantic_chunker import semantic_chunk, Chunk
+from app.knowledge_graph.chunking.chunk_ranker import rank_chunks
 
-OUTPUT_DIR = os.path.join("outputs", "graphs")
-DEFAULT_HTML = os.path.join(OUTPUT_DIR, "knowledge_graph.html")
+from app.knowledge_graph.extraction.async_runner import run_bounded
+from app.knowledge_graph.extraction.entity_extractor import extract_entities
+from app.knowledge_graph.extraction.relation_extractor import extract_relations
+from app.knowledge_graph.extraction.schema import Entity, Relation
+from app.knowledge_graph.postprocess.cleaner import clean_entities_relations
 
+from app.knowledge_graph.store.vector_store import InMemoryVectorStore
+from app.knowledge_graph.store.neo4j_store import sync_graph_documents
 
-def _read_source(source: str, is_path: bool) -> str:
-    """Read PDF/TXT from path or return raw text."""
-    if not is_path:
-        return source or ""
+LOGGER = setup_logging("data2dash.pipeline")
 
-    path = source
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Source path not found: {path}")
-
-    # PDF
-    if path.lower().endswith(".pdf"):
-        # Try your loader if present
-        try:
-            from app.knowledge_graph.ingestion.pdf_loader import load_pdf_text
-            return load_pdf_text(path)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load PDF via load_pdf_text: {e}")
-
-    # TXT or others
-    with open(path, "rb") as f:
-        raw = f.read()
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1", errors="ignore")
+_ONLY_NUMBER = re.compile(r"^\d+(\.\d+)?$")
 
 
-def _safe_get(obj, key: str, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+def _chunks_fallback(text: str, cfg: PipelineConfig) -> List[str]:
+    page_chunks = page_based_chunks(text, min_page_chars=120)
+    section_chunks = split_by_sections(text, max_chunk_size=2600, overlap=900)
+    sw_chunks = sliding_window_chunks(text, window_size=2400, step=700, max_chunks=40)
 
-
-def _ensure_html_with_pyvis(
-    nodes: List,
-    relationships: List,
-    html_path: str = DEFAULT_HTML,
-) -> str:
-    """Fallback HTML writer (Neo4j-like interactive graph) using PyVis."""
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
-
-    try:
-        from pyvis.network import Network
-    except Exception as e:
-        raise RuntimeError(
-            "PyVis is required for fallback visualization. Install: pip install pyvis"
-        ) from e
-
-    net = Network(height="750px", width="100%", directed=True, bgcolor="#ffffff")
-
-    # Add nodes
-    for n in nodes or []:
-        node_id = _safe_get(n, "id") or _safe_get(n, "name") or str(n)
-        node_type = _safe_get(n, "type", "Entity")
-        label = str(node_id)
-        title = f"{label}\nType: {node_type}"
-        net.add_node(str(node_id), label=label, title=title, group=str(node_type))
-
-    # Add edges
-    for r in relationships or []:
-        s = _safe_get(r, "source_node_id") or _safe_get(r, "source") or _safe_get(r, "from")
-        t = _safe_get(r, "target_node_id") or _safe_get(r, "target") or _safe_get(r, "to")
-        rel_type = _safe_get(r, "type") or _safe_get(r, "relation") or "RELATED_TO"
-        if not s or not t:
+    seen = set()
+    out: List[str] = []
+    for c in (page_chunks + section_chunks + sw_chunks):
+        c = (c or "").strip()
+        if len(c) < 200:
             continue
-        net.add_edge(str(s), str(t), label=str(rel_type), title=str(rel_type))
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
 
-    net.set_options("""
-    var options = {
-      "physics": { "enabled": true, "stabilization": {"iterations": 200} },
-      "interaction": { "hover": true, "navigationButtons": true, "keyboard": true },
-      "edges": { "smooth": false, "arrows": { "to": { "enabled": true } } }
-    }
-    """)
+    return out[: cfg.max_total_chunks]
 
-    net.write_html(html_path)
-    return html_path
+
+def _build_chunks(text: str, cfg: PipelineConfig) -> List[Chunk]:
+    strat = (cfg.chunk_strategy or "semantic").lower().strip()
+
+    if strat == "semantic":
+        chunks = semantic_chunk(text, cfg)
+    elif strat == "sections":
+        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(split_by_sections(text, 2600, 900))]
+    elif strat == "sliding":
+        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(sliding_window_chunks(text, 2400, 700, 40))]
+    elif strat == "pages":
+        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(page_based_chunks(text, 120))]
+    else:
+        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(_chunks_fallback(text, cfg))]
+
+    chunks = rank_chunks(chunks)
+    chunks = chunks[: cfg.prioritize_top_k]
+    chunks = chunks[: cfg.max_total_chunks]
+    return chunks
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _norm_rel(r: str) -> str:
+    return _norm_text(r or "RELATED_TO").upper().replace(" ", "_")
+
+
+def _should_drop_node_id(node_id: str) -> bool:
+    """
+    Filter obvious garbage node ids.
+    We DO NOT drop if it contains letters (e.g., "L2.4 regularization" should be kept).
+    """
+    nid = _norm_text(node_id)
+    if not nid:
+        return True
+    # Drop numeric-only like "28.4"
+    if _ONLY_NUMBER.match(nid):
+        return True
+    # Drop super short like "1." or "."
+    if len(nid) <= 1:
+        return True
+    return False
+
+
+def _build_nodes_and_edges(
+    entities: List[Entity],
+    relations: List[Relation],
+) -> Tuple[List[Node], List[Relationship]]:
+    """
+    Critical: ensure every Relationship endpoint exists as a Node.
+    This prevents PyVis/vis.js error: "non existent node '...'"
+    """
+    node_map: Dict[str, Node] = {}
+
+    def add_node(node_id: str, node_type: str) -> None:
+        nid = _norm_text(str(node_id))
+        ntype = _norm_text(str(node_type or "Concept")) or "Concept"
+        if _should_drop_node_id(nid):
+            return
+        key = nid.lower()
+        if key not in node_map:
+            node_map[key] = Node(id=nid, type=ntype)
+
+    # 1) Nodes from entities
+    for e in entities:
+        add_node(e.name, e.type)
+
+    # 2) Ensure endpoints exist for every relation + build edges
+    edges: List[Relationship] = []
+    for r in relations:
+        h = _norm_text(r.head)
+        t = _norm_text(r.tail)
+        rt = _norm_rel(r.relation)
+
+        if _should_drop_node_id(h) or _should_drop_node_id(t):
+            continue
+        if not rt:
+            rt = "RELATED_TO"
+
+        add_node(h, r.head_type)
+        add_node(t, r.tail_type)
+
+        # If still missing (because got filtered), skip edge safely
+        hs = h.lower()
+        ts = t.lower()
+        if hs not in node_map or ts not in node_map:
+            continue
+
+        edges.append(
+            Relationship(
+                source=node_map[hs],
+                target=node_map[ts],
+                type=rt,
+            )
+        )
+
+    return list(node_map.values()), edges
+
+
+async def _extract_for_chunk(llm, text: str, cfg: PipelineConfig) -> Tuple[List[Entity], List[Relation]]:
+    ents = extract_entities(llm, text, cfg.max_chunk_chars_for_llm)
+    rels = extract_relations(llm, text, ents, cfg.max_chunk_chars_for_llm)
+    return ents, rels
+
+
+def run_async(coro):
+    """
+    Keep it simple. If Streamlit ever complains about event loop,
+    we can move execution to a thread in the UI.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    return loop.run_until_complete(coro)
+
+
+def _make_job(llm, chunk_text: str, cfg: PipelineConfig) -> Callable[[], Awaitable[Tuple[List[Entity], List[Relation]]]]:
+    async def job():
+        return await _extract_for_chunk(llm, chunk_text, cfg)
+    return job
 
 
 def generate_knowledge_graph(
     source: str,
-    *,
-    is_path: bool = False,
-    sync_neo4j: bool = False,
+    is_path: bool = True,
     cfg: Optional[PipelineConfig] = None,
-    query_terms=None,
-) -> Tuple[Optional[str], List[GraphDocument], bool]:
-    """
-    ✅ Streamlit-compatible signature:
-    Returns: (html_path, graph_docs, sync_status)
-    """
+) -> Tuple[InMemoryVectorStore, List[GraphDocument], Optional[bool]]:
     cfg = cfg or PipelineConfig()
-    query_terms = query_terms or ["method", "results", "model", "dataset"]
-
-    # 0) read content
-    text = _read_source(source, is_path=is_path).strip()
-    if not text:
-        LOGGER.warning("Empty input text after reading source.")
-        return None, [], False
-
-    # Optional preprocess if you have it
-    try:
-        from app.knowledge_graph.preprocessing import preprocess_text
-        text = preprocess_text(text)
-    except Exception:
-        pass
-
-    # 1) rank/select chunks
-    selected_chunks = rank_chunks(
-        text,
-        query_terms=query_terms,
-        max_chars=cfg.max_chunk_chars_for_llm,
-        keep_k=min(cfg.prioritize_top_k, cfg.max_total_chunks),
-    )
-    LOGGER.info(f"Selected {len(selected_chunks)} ranked chunks for LLM")
-    if not selected_chunks:
-        LOGGER.warning("No chunks selected (rank_chunks returned empty).")
-        return None, [], False
-
-    # 2) build LLM
     llm = build_llm(cfg)
 
-    # 3) entities
-    ent = extract_entities(
-        llm,
-        selected_chunks,
-        max_retries=cfg.max_retries,
-        backoff=cfg.retry_base_delay,
-    )
-    ent = dedupe_entities(ent)
+    # 1) Load
+    raw = load_pdf_text(source, with_page_markers=True) if is_path else (source or "")
+    if not raw.strip():
+        gd = GraphDocument(nodes=[], relationships=[], source=Document(page_content=""))
+        return InMemoryVectorStore(), [gd], None
 
-    # 4) relations
-    rel = extract_relations(
-        llm,
-        selected_chunks,
-        ent,
-        max_retries=cfg.max_retries,
-        backoff=cfg.retry_base_delay,
-    )
-    rel = dedupe_relations(rel, ent)
+    # 2) Preprocess
+    text = preprocess_text(raw)
 
-    # 5) supplement pass (only 1 extra chunk) if too few relations
-    if len(getattr(rel, "relationships", []) or []) < cfg.min_relationships_target:
-        LOGGER.info(
-            f"Relations ({len(rel.relationships)}) below target ({cfg.min_relationships_target}) -> supplement pass"
-        )
-        extra_chunks = rank_chunks(
-            text,
-            query_terms=query_terms + ["conclusion", "experiment", "evaluation"],
-            max_chars=cfg.max_chunk_chars_for_llm,
-            keep_k=min(min(cfg.prioritize_top_k + 1, 8), cfg.max_total_chunks + 1),
-        )
-        extra = extra_chunks[-1:] if extra_chunks else []
-        if extra:
-            rel2 = extract_relations(
-                llm,
-                extra,
-                ent,
-                max_retries=cfg.max_retries,
-                backoff=cfg.retry_base_delay,
-            )
-            rel2 = dedupe_relations(rel2, ent)
-            rel.relationships.extend(rel2.relationships)
-            rel = dedupe_relations(rel, ent)
+    # 3) Chunk
+    chunks = _build_chunks(text, cfg)
+    if not chunks:
+        gd = GraphDocument(nodes=[], relationships=[], source=Document(page_content=""))
+        return InMemoryVectorStore(), [gd], None
 
-    nodes = getattr(ent, "nodes", []) or []
-    relationships = getattr(rel, "relationships", []) or []
-    LOGGER.info(f"Final Nodes: {len(nodes)} | Final Relations: {len(relationships)}")
+    LOGGER.info("Chunks: %d (strategy=%s)", len(chunks), cfg.chunk_strategy)
 
-    # 6) build GraphDocument (what Streamlit expects as graph_docs)
+    # 4) Vector store indexing (GraphRAG hook)
+    vstore = InMemoryVectorStore()
+    vstore.add_texts([c.id for c in chunks], [c.text for c in chunks])
 
-    doc = Document(
-        page_content=text,
-        metadata={"source": "uploaded_file" if is_path else "manual_text"}
+    # 5) Extract (async bounded)
+    jobs = [_make_job(llm, c.text, cfg) for c in chunks]
+    results = run_async(run_bounded(cfg, jobs))
+
+    all_entities: List[Entity] = []
+    all_relations: List[Relation] = []
+    for ents, rels in results:
+        all_entities.extend(ents)
+        all_relations.extend(rels)
+
+    # 6) Clean/dedupe
+    all_entities, all_relations = clean_entities_relations(all_entities, all_relations)
+
+    # 7) Build GraphDocument (SAFE endpoints)
+    nodes, rels = _build_nodes_and_edges(all_entities, all_relations)
+
+    graph_doc = GraphDocument(
+        nodes=nodes,
+        relationships=rels,
+        source=Document(page_content="Merged chunks"),
     )
 
-    graph_docs = [GraphDocument(nodes=nodes, relationships=relationships, source=doc)]
+    LOGGER.info("Nodes: %d | Relations: %d", len(nodes), len(rels))
 
-    # 7) visualization (try your visualize_graph, else fallback PyVis)
-    html_path = None
-    try:
-        from app.knowledge_graph.visualization import visualize_graph
-        # expected to return path OR write default
-        html_path = visualize_graph(graph_docs, out_path=DEFAULT_HTML)  # if your func supports it
-        if not html_path:
-            html_path = DEFAULT_HTML if os.path.exists(DEFAULT_HTML) else None
-    except TypeError:
-        # visualize_graph signature different
-        try:
-            from app.knowledge_graph.visualization import visualize_graph
-            html_path = visualize_graph(graph_docs)  # old signature
-            if not html_path:
-                html_path = DEFAULT_HTML if os.path.exists(DEFAULT_HTML) else None
-        except Exception as e:
-            LOGGER.warning(f"visualize_graph failed, using fallback PyVis. Reason: {e}")
-            html_path = _ensure_html_with_pyvis(nodes, relationships, DEFAULT_HTML)
-    except Exception as e:
-        LOGGER.warning(f"visualize_graph failed, using fallback PyVis. Reason: {e}")
-        html_path = _ensure_html_with_pyvis(nodes, relationships, DEFAULT_HTML)
+    # 8) Optional Neo4j sync
+    sync_status = None
+    if cfg.sync_neo4j:
+        sync_status = sync_graph_documents(cfg, [graph_doc])
 
-    # 8) Neo4j sync (optional)
-    sync_status = False
-    if sync_neo4j:
-        try:
-            from app.knowledge_graph.store.neo4j_store import sync_to_neo4j
-            sync_status = bool(sync_to_neo4j(graph_docs, cfg))
-        except Exception as e:
-            LOGGER.warning(f"Neo4j sync failed: {e}")
-            sync_status = False
-
-    return html_path, graph_docs, sync_status
+    return vstore, [graph_doc], sync_status

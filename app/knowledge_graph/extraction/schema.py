@@ -1,18 +1,17 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
 
-class Entity(BaseModel):
-    id: str = Field(..., description="Canonical entity name")
-    type: str = Field(..., description="Entity type label")
+@dataclass(frozen=True)
+class Entity:
+    name: str
+    type: str = "Concept"
 
-class Relation(BaseModel):
-    source: str
-    target: str
-    type: str
-    evidence: Optional[str] = None  
-
-class EntityResult(BaseModel):
-    nodes: List[Entity]
-
-class RelationResult(BaseModel):
-    relationships: List[Relation]
+@dataclass(frozen=True)
+class Relation:
+    head: str
+    head_type: str
+    relation: str
+    tail: str
+    tail_type: str
+    evidence: Optional[str] = None
