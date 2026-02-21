@@ -1,26 +1,36 @@
 # Core
-python-dotenv>=1.0.1
 streamlit>=1.31.0
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.0.0,<3.0.0
+typing-extensions>=4.9.0
+numpy>=1.26.0
+# ---- LangChain v1 stack (aligned) ----
+langchain-core==1.2.14
+langchain-community==0.4.1
+langchain-groq==1.1.2
+groq>=0.30.0,<1.0.0
+# LangChain v1 split packages (avoid resolver weirdness)
+langchain-classic==1.0.1
+langchain-text-splitters>=1.1.0,<2.0.0
 
-# LangChain 
-langchain>=0.1.16,<0.2.0
-langchain-core>=0.1.45,<0.2.0
-langchain-community>=0.0.38,<0.1
-langchain-experimental>=0.0.55,<0.1.0
-langchain-groq>=0.1.2,<0.2.0
-groq>=0.9.0
+# HTTPX pin (fix "proxies" init error)
+httpx>=0.27,<0.28
 
 # PDF
 pypdf>=4.0.0
 
-# Data models
-pydantic>=2.6.0,<3.0.0
+# Embeddings
+sentence-transformers>=2.2.2
 
 # Visualization
 pyvis>=0.3.2
 networkx>=3.2.0
 
-# Utilities
-json-repair>=0.7.0
-typing-extensions
-sentence-transformers>=2.2.2
+# Graph DB (Neo4j sync)
+neo4j>=5.20.0
+
+# Optional (only if you still call it anywhere)
+# json-repair>=0.7.0
+
+# Optional (REMOVE if you adopt Settings ENV_FILE fully)
+# python-dotenv>=1.0.1

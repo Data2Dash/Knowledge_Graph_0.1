@@ -1,240 +1,268 @@
 from __future__ import annotations
 
-# Reuse your exact implementation (copied) but expose:
-# - PreprocessConfig
-# - preprocess_text(text, cfg)
-# - make_chunks(text, strategy, cfg)
-# For brevity: import from your existing module if you keep it.
+from dataclasses import dataclass
+from typing import List, Optional, Literal
+import re
+import unicodedata
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-import os, re, unicodedata, logging
+from app.core.config import PipelineConfig
+from app.core.logging import setup_logging
+from app.knowledge_graph.chunking.structure_parser import to_sections
+from app.knowledge_graph.chunking.semantic_chunker import semantic_chunk, Chunk
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = setup_logging("knowledge_graph.text_cleaner")
 
-DEFAULT_ENTITY_MAP: Dict[str, str] = {
-    "llms": "Large Language Models",
-    "llm": "Large Language Model",
-    "kg": "Knowledge Graph",
-    "kgs": "Knowledge Graphs",
-    "nlp": "Natural Language Processing",
-    "gnn": "Graph Neural Network",
-    "transformer": "Transformer Architecture",
-    "cnn": "Convolutional Neural Network",
-    "rnn": "Recurrent Neural Network",
-}
+ChunkStrategy = Literal["semantic", "sections", "sliding", "pages"]
 
-DEFAULT_STOP_HEADINGS = (
-    "references","bibliography","acknowledgment","acknowledgements","appendix",
-    "supplementary material","author contributions","ethics statement","data availability",
-    "conflict of interest","funding",
-)
 
-DEFAULT_SECTION_HEADINGS = (
-    "Abstract","Introduction","Background","Related Work","Preliminaries","Methodology","Methods",
-    "Approach","Model Architecture","Model","Architecture","Implementation","Training","Datasets",
-    "Benchmarks","Experimental Setup","Setup","Experiments","Results","Evaluation","Analysis",
-    "Ablation","Discussion","Limitations","Future Work","Conclusion","Contributions","Key Findings",
-    "Findings","Proposed Method",
-)
+# -----------------------------
+# Config
+# -----------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessConfig:
     unicode_normalize: bool = True
     strip_null_bytes: bool = True
     normalize_newlines: bool = True
-    keep_double_newlines: bool = True
-
-    remove_numeric_citations: bool = True
-    remove_year_only_parens: bool = True
-    remove_bullets: bool = True
-    remove_decorative_lines: bool = True
     fix_hyphenated_linebreaks: bool = True
-    remove_inline_latex: bool = False
-    remove_display_latex: bool = False
 
-    stop_headings: Tuple[str, ...] = DEFAULT_STOP_HEADINGS
-    entity_map: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ENTITY_MAP))
+    remove_numeric_citations: bool = True         # [1], [2,3]
+    remove_year_only_parens: bool = True          # (2020)
+    remove_inline_latex: bool = False             # $...$
+    remove_display_latex: bool = False            # $$...$$
 
-    max_chunk_size: int = 3500
-    overlap: int = 450
+    # Used for sliding/pages/oversized sections
+    max_chunk_soft_chars: int = 2800
+    max_chunk_hard_chars: int = 3500
+    overlap_chars: int = 400
 
-    sliding_window_size: int = 2800
-    sliding_step: int = 900
-    sliding_max_chunks: int = 30
-
-    min_page_chars: int = 150
-    section_headings: Tuple[str, ...] = DEFAULT_SECTION_HEADINGS
+    # Safety caps
+    min_chunk_chars: int = 300
+    max_chunks: int = 120
 
 
-def _compile_patterns(cfg: PreprocessConfig):
-    numeric_citations = re.compile(
-        r"\[(?:\s*\d+\s*(?:[-–]\s*\d+\s*)?)(?:\s*,\s*\d+\s*(?:[-–]\s*\d+\s*)?)*\]"
-    )
-    year_only_parens = re.compile(r"\(\s*\d{4}\s*\)")
-    bullets = re.compile(r"[•▪■►◆▶●◦]")
-    decorative_lines = re.compile(r"(?:-{3,}|={3,}|_{3,}|\*{3,})")
-    spaces_tabs = re.compile(r"[ \t]+")
-    many_newlines = re.compile(r"\n{3,}")
-    hyphen_linebreak = re.compile(r"(\w)-\n(\w)")
-    inline_latex = re.compile(r"\$(?!\s)(.*?)(?<!\s)\$", flags=re.DOTALL)
-    display_latex_1 = re.compile(r"\\\[(.*?)\\\]", flags=re.DOTALL)
-    display_latex_2 = re.compile(r"\$\$(.*?)\$\$", flags=re.DOTALL)
+def _derive_preprocess_cfg(
+    preprocess_cfg: Optional[PreprocessConfig],
+    pipeline_cfg: Optional[PipelineConfig],
+) -> PreprocessConfig:
+    """
+    If preprocess_cfg isn't provided, derive reasonable defaults from PipelineConfig
+    so chunk sizes stay consistent across the project.
+    """
+    if preprocess_cfg is not None:
+        return preprocess_cfg
 
-    stop_heading_union = "|".join(re.escape(h) for h in cfg.stop_headings)
-    stop_heading = re.compile(rf"^(\d+\.?\s*)?({stop_heading_union})$", flags=re.IGNORECASE)
+    if pipeline_cfg is None:
+        return PreprocessConfig()
 
-    section_union = "|".join(cfg.section_headings).replace(" ", r"\s+")
-    section_regex = re.compile(
-        rf"(?m)^(?:\d+\.|[IVX]+\.|[IVX]+\b|\d+\b)?\s*({section_union})\s*$",
-        flags=re.IGNORECASE,
-    )
+    soft = int(getattr(pipeline_cfg, "semantic_target_chunk_chars", 2800))
+    hard = int(getattr(pipeline_cfg, "semantic_max_chunk_chars", 3500))
+    hard = max(hard, soft)
 
-    return dict(
-        numeric_citations=numeric_citations,
-        year_only_parens=year_only_parens,
-        bullets=bullets,
-        decorative_lines=decorative_lines,
-        spaces_tabs=spaces_tabs,
-        many_newlines=many_newlines,
-        hyphen_linebreak=hyphen_linebreak,
-        inline_latex=inline_latex,
-        display_latex_1=display_latex_1,
-        display_latex_2=display_latex_2,
-        stop_heading=stop_heading,
-        section_regex=section_regex,
+    # overlap heuristic: ~15% of soft cap, bounded
+    overlap = max(200, min(800, soft // 6))
+
+    return PreprocessConfig(
+        max_chunk_soft_chars=soft,
+        max_chunk_hard_chars=hard,
+        overlap_chars=overlap,
     )
 
+
+# -----------------------------
+# Cleaning
+# -----------------------------
 
 def clean_text(text: str, cfg: Optional[PreprocessConfig] = None) -> str:
     cfg = cfg or PreprocessConfig()
-    pat = _compile_patterns(cfg)
-    if text is None:
+    if not text:
         return ""
+
     if cfg.strip_null_bytes:
         text = text.replace("\x00", "")
+
     if cfg.normalize_newlines:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+
     if cfg.unicode_normalize:
         text = unicodedata.normalize("NFKC", text)
+
     if cfg.fix_hyphenated_linebreaks:
-        text = pat["hyphen_linebreak"].sub(r"\1\2", text)
+        # join "hyphen-\nated" -> "hyphenated"
+        text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
 
     if cfg.remove_numeric_citations:
-        text = pat["numeric_citations"].sub("", text)
+        text = re.sub(r"\[(\d+(?:,\s*\d+)*)\]", "", text)
+
     if cfg.remove_year_only_parens:
-        text = pat["year_only_parens"].sub("", text)
-    if cfg.remove_bullets:
-        text = pat["bullets"].sub("", text)
-    if cfg.remove_decorative_lines:
-        text = pat["decorative_lines"].sub(" ", text)
+        text = re.sub(r"\(\d{4}\)", "", text)
 
     if cfg.remove_display_latex:
-        text = pat["display_latex_1"].sub(" ", text)
-        text = pat["display_latex_2"].sub(" ", text)
-    if cfg.remove_inline_latex:
-        text = pat["inline_latex"].sub(" ", text)
+        text = re.sub(r"\$\$(.*?)\$\$", " ", text, flags=re.DOTALL)
 
-    text = pat["spaces_tabs"].sub(" ", text)
-    if cfg.keep_double_newlines:
-        text = pat["many_newlines"].sub("\n\n", text)
+    if cfg.remove_inline_latex:
+        text = re.sub(r"\$(.*?)\$", " ", text)
+
+    # whitespace normalization
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
     return text.strip()
 
 
-def remove_irrelevant_sections(text: str, cfg: Optional[PreprocessConfig] = None) -> str:
-    cfg = cfg or PreprocessConfig()
-    pat = _compile_patterns(cfg)
-    if not text.strip():
-        return ""
-    out = []
-    for line in text.split("\n"):
-        cl = line.strip().lower()
-        if 0 < len(cl) < 60 and pat["stop_heading"].match(cl):
-            break
-        out.append(line)
-    return "\n".join(out).strip()
+# -----------------------------
+# Sliding window (char-aware)
+# -----------------------------
 
-
-def normalize_entities(text: str, cfg: Optional[PreprocessConfig] = None) -> str:
-    cfg = cfg or PreprocessConfig()
-    if not text.strip():
-        return ""
-    items = sorted(cfg.entity_map.items(), key=lambda kv: len(kv[0]), reverse=True)
-    for short, full in items:
-        text = re.sub(rf"\b{re.escape(short)}\b", full, text, flags=re.IGNORECASE)
-    return text
-
-
-def preprocess_text(text: str, cfg: Optional[PreprocessConfig] = None) -> str:
-    cfg = cfg or PreprocessConfig()
-    t = clean_text(text, cfg=cfg)
-    t = remove_irrelevant_sections(t, cfg=cfg)
-    t = normalize_entities(t, cfg=cfg)
-    return t
-
-
-# Keep your existing chunk strategies (sections/sliding/pages) for fallback.
-def split_by_sections(text: str, max_chunk_size: int = 3500, overlap: int = 450, cfg: Optional[PreprocessConfig] = None):
-    cfg = cfg or PreprocessConfig()
-    pat = _compile_patterns(cfg)
-    t = text.strip()
-    if not t:
+def sliding_window_chunks(text: str, cfg: PreprocessConfig) -> List[str]:
+    if not text:
         return []
-    parts = re.split(pat["section_regex"], t)
-    final_chunks = []
-    current = []
-    heading_prefix = re.compile(r"^(abstract|introduction|background|related|prelim|method|approach|model|architect|implement|train|dataset|benchmark|experimental|setup|experiment|result|evaluat|analysis|ablation|discuss|limit|future|conclus|contribution|finding|proposed)", flags=re.I)
-    for part in parts:
-        if not part:
-            continue
-        part = part.strip()
-        if len(part) < 60 and heading_prefix.match(part):
-            current.append(f"\n\n## {part}\n\n")
-            continue
-        current.append(part)
-        full = " ".join(current).strip()
-        if len(full) >= max_chunk_size:
-            final_chunks.append(full)
-            tail = full[-overlap:].strip() if overlap > 0 else ""
-            current = [tail] if tail else []
-    if current:
-        final_chunks.append(" ".join(current).strip())
-    return [c for c in final_chunks if len(c.strip()) >= 200]
 
+    soft = max(200, int(cfg.max_chunk_soft_chars))
+    hard = max(soft, int(cfg.max_chunk_hard_chars))
+    overlap = max(0, int(cfg.overlap_chars))
 
-def sliding_window_chunks(text: str, window_size: int = 2800, step: int = 900, max_chunks: int = 30):
-    t = text.strip()
-    if not t:
-        return []
-    if window_size <= 0 or step <= 0:
-        return [t]
-    chunks = []
+    step = max(1, soft - overlap)  # prevents infinite loop
+
+    chunks: List[str] = []
     start = 0
-    while start < len(t) and len(chunks) < max_chunks:
-        c = t[start:start+window_size].strip()
-        if len(c) >= 200:
-            chunks.append(c)
+
+    while start < len(text) and len(chunks) < int(cfg.max_chunks):
+        end = min(start + hard, len(text))
+        chunk = text[start:end].strip()
+
+        if len(chunk) >= int(cfg.min_chunk_chars):
+            chunks.append(chunk)
+
         start += step
+
     return chunks
 
 
-def page_based_chunks(text: str, min_page_chars: int = 150):
-    t = text.strip()
-    if not t:
-        return []
-    pages = re.split(r"\n*--- Page \d+ ---\n*", t)
-    pages = [p.strip() for p in pages if p.strip()]
-    out = []
-    buf = ""
-    for p in pages:
-        if buf and (len(buf) + len(p) < 4000):
-            buf = buf + "\n\n" + p
-        elif buf:
-            if len(buf.strip()) >= min_page_chars:
-                out.append(buf.strip())
-            buf = p
+# -----------------------------
+# Section-based
+# -----------------------------
+
+def sections_as_chunks(text: str, cfg: PreprocessConfig) -> List[str]:
+    sections = to_sections(text)
+    chunks: List[str] = []
+
+    for sec in sections:
+        body = "\n".join(p.text for p in sec.paragraphs).strip()
+        if not body:
+            continue
+
+        full = f"{sec.title}\n{body}".strip() if sec.title else body
+        if len(full) < int(cfg.min_chunk_chars):
+            continue
+
+        # If section too large, split it
+        if len(full) > int(cfg.max_chunk_hard_chars):
+            chunks.extend(sliding_window_chunks(full, cfg))
         else:
-            buf = p
-    if buf and len(buf.strip()) >= min_page_chars:
-        out.append(buf.strip())
-    return out
+            chunks.append(full)
+
+        if len(chunks) >= int(cfg.max_chunks):
+            break
+
+    return chunks[: int(cfg.max_chunks)]
+
+
+# -----------------------------
+# Page-based
+# -----------------------------
+
+_PAGE_SPLIT_PATTERNS = [
+    # [[PAGE 3]]
+    re.compile(r"(?:^|\n)\s*\[\[\s*PAGE\s*\d+\s*\]\]\s*(?:\n|$)", re.IGNORECASE),
+    # [PAGE:3]  (backward-compatible marker)
+    re.compile(r"(?:^|\n)\s*\[\s*PAGE\s*:\s*\d+\s*\]\s*(?:\n|$)", re.IGNORECASE),
+
+    # === Page 3 === / ---- Page 3 ----
+    re.compile(r"(?:^|\n)\s*(?:=+|-+)\s*page\s*\d+\s*(?:=+|-+)\s*(?:\n|$)", re.IGNORECASE),
+    # Page 3:
+    re.compile(r"(?:^|\n)\s*page\s*\d+\s*:\s*(?:\n|$)", re.IGNORECASE),
+]
+
+def _split_pages(text: str) -> List[str]:
+    """
+    Best-effort split based on common page markers.
+    If none found, returns [text].
+    """
+    for pat in _PAGE_SPLIT_PATTERNS:
+        parts = pat.split(text)
+        # if split actually happened
+        if len(parts) > 1:
+            parts = [p.strip() for p in parts if p.strip()]
+            return parts if parts else [text.strip()]
+    return [text.strip()] if text.strip() else []
+
+
+def pages_as_chunks(text: str, cfg: PreprocessConfig) -> List[str]:
+    pages = _split_pages(text)
+    out: List[str] = []
+
+    for p in pages:
+        if not p:
+            continue
+        if len(p) < int(cfg.min_chunk_chars):
+            continue
+
+        if len(p) > int(cfg.max_chunk_hard_chars):
+            out.extend(sliding_window_chunks(p, cfg))
+        else:
+            out.append(p)
+
+        if len(out) >= int(cfg.max_chunks):
+            break
+
+    return out[: int(cfg.max_chunks)]
+
+
+# -----------------------------
+# Semantic (delegation)
+# -----------------------------
+
+def _semantic_chunks_as_list(text: str, pipeline_cfg: PipelineConfig) -> List[Chunk]:
+    kg_chunks = semantic_chunk(text, pipeline_cfg)
+    return [ch for ch in kg_chunks if (ch.text or "").strip()]
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+
+def make_chunks(
+    text: str,
+    strategy: ChunkStrategy,
+    *,
+    pipeline_cfg: Optional[PipelineConfig] = None,
+    preprocess_cfg: Optional[PreprocessConfig] = None,
+) -> List[Chunk]:
+    """
+    Return list of Chunk(id, text) for pipeline and rank_chunks.
+    """
+    preprocess_cfg = _derive_preprocess_cfg(preprocess_cfg, pipeline_cfg)
+    cleaned = clean_text(text, preprocess_cfg)
+
+    if not cleaned:
+        return []
+
+    if strategy == "semantic":
+        if not pipeline_cfg:
+            raise ValueError("pipeline_cfg required for semantic chunking")
+        return _semantic_chunks_as_list(cleaned, pipeline_cfg)
+
+    if strategy == "sections":
+        raw = sections_as_chunks(cleaned, preprocess_cfg)
+        return [Chunk(id=f"sec:{i+1}", text=s) for i, s in enumerate(raw)]
+
+    if strategy == "sliding":
+        raw = sliding_window_chunks(cleaned, preprocess_cfg)
+        return [Chunk(id=f"win:{i+1}", text=s) for i, s in enumerate(raw)]
+
+    if strategy == "pages":
+        raw = pages_as_chunks(cleaned, preprocess_cfg)
+        return [Chunk(id=f"page:{i+1}", text=s) for i, s in enumerate(raw)]
+
+    raise ValueError(f"Unknown chunk strategy: {strategy}")

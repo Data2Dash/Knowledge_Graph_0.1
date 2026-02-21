@@ -1,101 +1,52 @@
+# app/pipelines/graph_pipeline.py
 from __future__ import annotations
 
 import asyncio
 import re
+import time
+from collections import Counter
 from typing import Optional, Tuple, List, Dict, Callable, Awaitable
 
 from langchain_core.documents import Document
-from langchain_community.graphs.graph_document import Node, Relationship
-from langchain_experimental.graph_transformers.llm import GraphDocument
+from langchain_community.graphs.graph_document import Node, Relationship, GraphDocument
 
 from app.core.config import PipelineConfig
 from app.core.logging import setup_logging
+from app.core.settings import get_settings
+
 from app.knowledge_graph.llm.groq_client import build_llm
-
 from app.knowledge_graph.ingestion.pdf_loader import load_pdf_text
-from app.knowledge_graph.preprocessing.text_cleaner import (
-    preprocess_text,
-    split_by_sections,
-    sliding_window_chunks,
-    page_based_chunks,
-)
-
-from app.knowledge_graph.chunking.semantic_chunker import semantic_chunk, Chunk
+from app.knowledge_graph.preprocessing.text_cleaner import make_chunks
 from app.knowledge_graph.chunking.chunk_ranker import rank_chunks
 
 from app.knowledge_graph.extraction.async_runner import run_bounded
 from app.knowledge_graph.extraction.entity_extractor import extract_entities
 from app.knowledge_graph.extraction.relation_extractor import extract_relations
 from app.knowledge_graph.extraction.schema import Entity, Relation
-from app.knowledge_graph.postprocess.cleaner import clean_entities_relations
+from app.knowledge_graph.extraction.validator import dedupe_entities, dedupe_relations
 
 from app.knowledge_graph.store.vector_store import InMemoryVectorStore
 from app.knowledge_graph.store.neo4j_store import sync_graph_documents
 
-LOGGER = setup_logging("data2dash.pipeline")
+LOGGER = setup_logging("knowledge_graph.pipeline")
 
 _ONLY_NUMBER = re.compile(r"^\d+(\.\d+)?$")
 
 
-def _chunks_fallback(text: str, cfg: PipelineConfig) -> List[str]:
-    page_chunks = page_based_chunks(text, min_page_chars=120)
-    section_chunks = split_by_sections(text, max_chunk_size=2600, overlap=900)
-    sw_chunks = sliding_window_chunks(text, window_size=2400, step=700, max_chunks=40)
-
-    seen = set()
-    out: List[str] = []
-    for c in (page_chunks + section_chunks + sw_chunks):
-        c = (c or "").strip()
-        if len(c) < 200:
-            continue
-        if c in seen:
-            continue
-        seen.add(c)
-        out.append(c)
-
-    return out[: cfg.max_total_chunks]
-
-
-def _build_chunks(text: str, cfg: PipelineConfig) -> List[Chunk]:
-    strat = (cfg.chunk_strategy or "semantic").lower().strip()
-
-    if strat == "semantic":
-        chunks = semantic_chunk(text, cfg)
-    elif strat == "sections":
-        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(split_by_sections(text, 2600, 900))]
-    elif strat == "sliding":
-        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(sliding_window_chunks(text, 2400, 700, 40))]
-    elif strat == "pages":
-        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(page_based_chunks(text, 120))]
-    else:
-        chunks = [Chunk(str(i + 1), c) for i, c in enumerate(_chunks_fallback(text, cfg))]
-
-    chunks = rank_chunks(chunks)
-    chunks = chunks[: cfg.prioritize_top_k]
-    chunks = chunks[: cfg.max_total_chunks]
-    return chunks
-
+# =========================
+# Utility Helpers
+# =========================
 
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _norm_rel(r: str) -> str:
-    return _norm_text(r or "RELATED_TO").upper().replace(" ", "_")
-
-
 def _should_drop_node_id(node_id: str) -> bool:
-    """
-    Filter obvious garbage node ids.
-    We DO NOT drop if it contains letters (e.g., "L2.4 regularization" should be kept).
-    """
     nid = _norm_text(node_id)
     if not nid:
         return True
-    # Drop numeric-only like "28.4"
     if _ONLY_NUMBER.match(nid):
         return True
-    # Drop super short like "1." or "."
     if len(nid) <= 1:
         return True
     return False
@@ -105,11 +56,8 @@ def _build_nodes_and_edges(
     entities: List[Entity],
     relations: List[Relation],
 ) -> Tuple[List[Node], List[Relationship]]:
-    """
-    Critical: ensure every Relationship endpoint exists as a Node.
-    This prevents PyVis/vis.js error: "non existent node '...'"
-    """
     node_map: Dict[str, Node] = {}
+    seen_edges = set()
 
     def add_node(node_id: str, node_type: str) -> None:
         nid = _norm_text(str(node_id))
@@ -120,109 +68,246 @@ def _build_nodes_and_edges(
         if key not in node_map:
             node_map[key] = Node(id=nid, type=ntype)
 
-    # 1) Nodes from entities
     for e in entities:
         add_node(e.name, e.type)
 
-    # 2) Ensure endpoints exist for every relation + build edges
     edges: List[Relationship] = []
+
     for r in relations:
         h = _norm_text(r.head)
         t = _norm_text(r.tail)
-        rt = _norm_rel(r.relation)
+        rt = _norm_text(getattr(r, "predicate", None) or (r.relation or "RELATED_TO")).upper().replace(" ", "_")
 
         if _should_drop_node_id(h) or _should_drop_node_id(t):
             continue
-        if not rt:
-            rt = "RELATED_TO"
+        if h.lower() == t.lower():
+            continue
 
         add_node(h, r.head_type)
         add_node(t, r.tail_type)
 
-        # If still missing (because got filtered), skip edge safely
-        hs = h.lower()
-        ts = t.lower()
+        hs, ts = h.lower(), t.lower()
         if hs not in node_map or ts not in node_map:
             continue
 
-        edges.append(
-            Relationship(
-                source=node_map[hs],
-                target=node_map[ts],
-                type=rt,
-            )
-        )
+        edge_key = (hs, ts, rt)
+        if edge_key in seen_edges:
+            continue
+        seen_edges.add(edge_key)
+
+        edges.append(Relationship(source=node_map[hs], target=node_map[ts], type=rt))
 
     return list(node_map.values()), edges
 
 
-async def _extract_for_chunk(llm, text: str, cfg: PipelineConfig) -> Tuple[List[Entity], List[Relation]]:
-    ents = extract_entities(llm, text, cfg.max_chunk_chars_for_llm)
-    rels = extract_relations(llm, text, ents, cfg.max_chunk_chars_for_llm)
-    return ents, rels
-
-
 def run_async(coro):
     """
-    Keep it simple. If Streamlit ever complains about event loop,
-    we can move execution to a thread in the UI.
+    Streamlit-safe runner:
+    - if no running loop -> asyncio.run
+    - if loop exists -> run in a separate thread
     """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    return loop.run_until_complete(coro)
+
+    import threading
+
+    result_holder = {"value": None, "err": None}
+
+    def _runner():
+        try:
+            result_holder["value"] = asyncio.run(coro)
+        except Exception as e:
+            result_holder["err"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+
+    if result_holder["err"] is not None:
+        raise result_holder["err"]
+    return result_holder["value"]
 
 
-def _make_job(llm, chunk_text: str, cfg: PipelineConfig) -> Callable[[], Awaitable[Tuple[List[Entity], List[Relation]]]]:
+def _merge_local_and_global_entities(
+    local_ents: List[Entity],
+    global_ents: List[Entity],
+    *,
+    max_total: int = 80,
+) -> List[Entity]:
+    out: List[Entity] = []
+    seen = set()
+
+    def add(e: Entity):
+        key = (e.name.lower(), e.type)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(e)
+
+    for e in local_ents:
+        add(e)
+        if len(out) >= max_total:
+            return out
+
+    for e in global_ents:
+        add(e)
+        if len(out) >= max_total:
+            return out
+
+    return out
+def _make_job_entities(llm, chunk_text: str, cfg: PipelineConfig, context: dict):
+    timeout_s = float(getattr(cfg, "request_timeout_s", 60.0))
+    max_chars = int(getattr(cfg, "max_chunk_chars_for_llm", 6000))  # ✅ important
+
     async def job():
-        return await _extract_for_chunk(llm, chunk_text, cfg)
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: extract_entities(
+                    llm=llm,
+                    text=chunk_text,
+                    max_chars=max_chars,   # ✅ FIX
+                    cfg=cfg,
+                    context=context,
+                ),
+            ),
+            timeout=timeout_s,
+        )
+
     return job
 
+def _make_job_relations(llm, chunk_text: str, entities: List[Entity], cfg: PipelineConfig, context: dict):
+    timeout_s = float(getattr(cfg, "request_timeout_s", 60.0))
+
+    async def job():
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: extract_relations(
+                    llm=llm,
+                    chunk_text=chunk_text,
+                    entities=entities,
+                    cfg=cfg,
+                    context=context,
+                ),
+            ),
+            timeout=timeout_s,
+        )
+
+    return job
+
+
+# =========================
+# Main Pipeline
+# =========================
 
 def generate_knowledge_graph(
     source: str,
     is_path: bool = True,
     cfg: Optional[PipelineConfig] = None,
 ) -> Tuple[InMemoryVectorStore, List[GraphDocument], Optional[bool]]:
-    cfg = cfg or PipelineConfig()
-    llm = build_llm(cfg)
+    start_time = time.time()
 
-    # 1) Load
+    settings = get_settings()
+    settings.ensure_runtime_dirs()
+
+    cfg = cfg or PipelineConfig()
+    llm = build_llm(cfg, settings=settings)
+
     raw = load_pdf_text(source, with_page_markers=True) if is_path else (source or "")
     if not raw.strip():
         gd = GraphDocument(nodes=[], relationships=[], source=Document(page_content=""))
         return InMemoryVectorStore(), [gd], None
 
-    # 2) Preprocess
-    text = preprocess_text(raw)
-
-    # 3) Chunk
-    chunks = _build_chunks(text, cfg)
+    chunks = make_chunks(raw, cfg.chunk_strategy, pipeline_cfg=cfg)
     if not chunks:
         gd = GraphDocument(nodes=[], relationships=[], source=Document(page_content=""))
         return InMemoryVectorStore(), [gd], None
 
-    LOGGER.info("Chunks: %d (strategy=%s)", len(chunks), cfg.chunk_strategy)
+    ranked = rank_chunks(chunks, cfg=cfg)
 
-    # 4) Vector store indexing (GraphRAG hook)
+    # Respect both knobs deterministically
+    max_keep = min(int(cfg.max_total_chunks), int(cfg.prioritize_top_k))
+    ranked = ranked[:max_keep]
+
+    chunk_ids = [str(c.id) for c in ranked]
+    chunk_texts = [str(c.text) for c in ranked]
+
+    LOGGER.info("Chunks selected", extra={"count": len(chunk_texts)})
+
+    # Vector store
     vstore = InMemoryVectorStore()
-    vstore.add_texts([c.id for c in chunks], [c.text for c in chunks])
+    vstore.add_texts(
+        ids=[f"chunk:{cid}" for cid in chunk_ids],
+        texts=chunk_texts,
+        cfg=cfg,
+        metas=[{"kind": "chunk", "chunk_id": cid} for cid in chunk_ids],
+    )
 
-    # 5) Extract (async bounded)
-    jobs = [_make_job(llm, c.text, cfg) for c in chunks]
-    results = run_async(run_bounded(cfg, jobs))
+    # =========================
+    # Stage A — Entities
+    # =========================
+    ent_jobs = []
+    for cid, txt in zip(chunk_ids, chunk_texts):
+        ctx = {"chunk_id": cid, "source": source}
+        ent_jobs.append(_make_job_entities(llm, txt, cfg, ctx))
 
-    all_entities: List[Entity] = []
-    all_relations: List[Relation] = []
-    for ents, rels in results:
-        all_entities.extend(ents)
-        all_relations.extend(rels)
+    ent_results = run_async(run_bounded(cfg, ent_jobs, return_exceptions=True, context={"stage": "entities"}))
 
-    # 6) Clean/dedupe
-    all_entities, all_relations = clean_entities_relations(all_entities, all_relations)
+    ent_lists: List[List[Entity]] = []
+    for i, result in enumerate(ent_results):
+        if isinstance(result, Exception):
+            LOGGER.error("Entity extraction failed", extra={"chunk_id": chunk_ids[i], "error": repr(result)[:800]})
+            ent_lists.append([])
+        else:
+            ent_lists.append(result)
 
-    # 7) Build GraphDocument (SAFE endpoints)
+    all_entities = [e for sub in ent_lists for e in sub]
+    all_entities = dedupe_entities(all_entities)
+
+    LOGGER.info("Entities extracted", extra={"count": len(all_entities)})
+
+    # Select global entities by frequency across chunks (helps relation grounding)
+    freq = Counter((e.name.lower(), e.type) for e in all_entities)
+    global_entities = sorted(all_entities, key=lambda e: freq[(e.name.lower(), e.type)], reverse=True)[:200]
+
+    # =========================
+    # Stage B — Relations
+    # =========================
+    rel_jobs = []
+    for cid, txt, local_ents in zip(chunk_ids, chunk_texts, ent_lists):
+        ctx = {"chunk_id": cid, "source": source}
+        ents_for_chunk = _merge_local_and_global_entities(
+            local_ents,
+            global_entities,
+            max_total=int(getattr(cfg, "relation_max_entities_in_prompt", 80)),
+        )
+        rel_jobs.append(_make_job_relations(llm, txt, ents_for_chunk, cfg, ctx))
+
+    rel_results = run_async(run_bounded(cfg, rel_jobs, return_exceptions=True, context={"stage": "relations"}))
+
+    rel_lists: List[List[Relation]] = []
+    for i, result in enumerate(rel_results):
+        if isinstance(result, Exception):
+            LOGGER.error("Relation extraction failed", extra={"chunk_id": chunk_ids[i], "error": str(result)[:500]})
+            rel_lists.append([])
+        else:
+            rel_lists.append(result)
+
+    all_relations = [r for sub in rel_lists for r in sub]
+
+    # Canonicalize + type-infer using entity list, then dedupe
+    all_relations = dedupe_relations(all_relations, all_entities)
+
+    LOGGER.info("Relations extracted", extra={"count": len(all_relations)})
+
+    # =========================
+    # Build Graph
+    # =========================
     nodes, rels = _build_nodes_and_edges(all_entities, all_relations)
 
     graph_doc = GraphDocument(
@@ -231,11 +316,19 @@ def generate_knowledge_graph(
         source=Document(page_content="Merged chunks"),
     )
 
-    LOGGER.info("Nodes: %d | Relations: %d", len(nodes), len(rels))
+    LOGGER.info("Final graph", extra={"nodes": len(nodes), "relationships": len(rels)})
 
-    # 8) Optional Neo4j sync
-    sync_status = None
-    if cfg.sync_neo4j:
-        sync_status = sync_graph_documents(cfg, [graph_doc])
+    # =========================
+    # Neo4j Sync (from Settings)
+    # =========================
+    sync_status: Optional[bool] = None
+    if settings.SYNC_NEO4J:
+        try:
+            sync_status = sync_graph_documents(settings, [graph_doc])
+        except Exception as e:
+            LOGGER.error("Neo4j sync failed", extra={"error": str(e)[:700]})
+            sync_status = False
+
+    LOGGER.info("Pipeline completed", extra={"duration_s": round(time.time() - start_time, 2)})
 
     return vstore, [graph_doc], sync_status
