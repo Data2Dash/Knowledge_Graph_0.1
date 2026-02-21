@@ -1,3 +1,4 @@
+#C:\Users\Maryem\Knowledge_Graph_0.1\app\knowledge_graph\ingestion\pdf_loader.py
 from __future__ import annotations
 from langchain_community.document_loaders import PyPDFLoader
 
