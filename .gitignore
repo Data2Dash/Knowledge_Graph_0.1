@@ -151,12 +151,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
-outputs/
-*.html
-data2dash.log
-.env
-__pycache__/
-*.pyc
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

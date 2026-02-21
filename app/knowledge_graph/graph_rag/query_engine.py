@@ -1,55 +1,43 @@
-# app/knowledge_graph/graph_rag/query_engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
-import time
 
-from pydantic import SecretStr
 from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
 
-from app.core.logging import setup_logging
-from app.core.settings import Settings, get_settings
 from app.knowledge_graph.store.vector_store import InMemoryVectorStore
-from app.knowledge_graph.graph_rag.retriever import retrieve_chunks, RetrievedChunk, RetrieverConfig
-from app.knowledge_graph.graph_rag.context_builder import build_context as build_context_md, ContextConfig
 
 try:
     from langchain_community.graphs import Neo4jGraph
 except Exception:
     Neo4jGraph = None
 
-LOGGER = setup_logging("knowledge_graph.graphrag")
+
+@dataclass(frozen=True)
+class RetrievedChunk:
+    chunk_id: str
+    text: str
+    score: float
 
 
-# ==========================================================
-# Config
-# ==========================================================
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class QueryConfig:
     top_k_chunks: int = 6
     max_chunk_chars_each: int = 1200
     expand_hops: int = 1
     max_graph_facts: int = 60
-    max_total_context_chars: int = 14000
-    answer_max_chars: int = 1500
-    include_reverse_edges: bool = True  # kept for API stability
 
-
-# ==========================================================
-# Prompt
-# ==========================================================
 
 ANSWER_PROMPT = """\
 You are a research assistant using GraphRAG.
+Answer the user using ONLY the provided context.
+If context is insufficient, say what is missing.
 
-STRICT RULES:
-- Use ONLY the provided context.
-- If the context does not contain the answer, say what is missing.
-- Do NOT invent facts.
-- Cite sources using [Chunk X] or [Graph Fact].
+Requirements:
+- Provide a concise answer.
+- Then provide "Evidence" with bullet points citing chunk IDs like [Chunk 3].
+- Do not invent citations.
 
 User question:
 {question}
@@ -59,72 +47,60 @@ Context:
 """
 
 
-# ==========================================================
-# Helpers
-# ==========================================================
+def retrieve_chunks(vstore: InMemoryVectorStore, query: str, qc: QueryConfig) -> List[RetrievedChunk]:
+    results = vstore.search(query, top_k=qc.top_k_chunks)
+    out: List[RetrievedChunk] = []
+    for cid, text, score in results:
+        out.append(RetrievedChunk(chunk_id=str(cid), text=text, score=float(score)))
+    return out
+
 
 def _truncate(s: str, n: int) -> str:
     s = (s or "").strip()
-    return s if len(s) <= n else s[:n].rstrip() + "…"
+    if len(s) <= n:
+        return s
+    return s[: n].rstrip() + "…"
 
 
-def _neo4j_enabled(settings: Settings) -> bool:
-    # We treat Neo4j as "usable" if creds exist. SYNC_NEO4J is about writing, not reading.
-    if Neo4jGraph is None:
-        return False
-    if not settings.NEO4J_URL or not settings.NEO4J_USER:
-        return False
-    if not settings.NEO4J_PASSWORD.get_secret_value().strip():
-        return False
-    return True
+def _format_chunks(chunks: List[RetrievedChunk], qc: QueryConfig) -> str:
+    parts = ["# Retrieved Chunks"]
+    for ch in chunks:
+        parts.append(f"\n## [Chunk {ch.chunk_id}] score={ch.score:.3f}\n{_truncate(ch.text, qc.max_chunk_chars_each)}\n")
+    return "\n".join(parts).strip()
 
 
-# ==========================================================
-# Neo4j Facts (Safe + Limited)
-# ==========================================================
-
-def _fetch_graph_facts(
-    settings: Settings,
+def _fetch_graph_facts_from_neo4j(
+    neo4j_url: str,
+    neo4j_user: str,
+    neo4j_password: str,
     seed_terms: List[str],
     qc: QueryConfig,
 ) -> str:
-    if not _neo4j_enabled(settings) or not seed_terms:
+    if Neo4jGraph is None:
         return ""
 
-    try:
-        g = Neo4jGraph(
-            url=settings.NEO4J_URL,
-            username=settings.NEO4J_USER,
-            password=settings.NEO4J_PASSWORD.get_secret_value(),
-            database=settings.NEO4J_DATABASE.strip() or None,
-        )
-    except Exception:
-        return ""
+    g = Neo4jGraph(url=neo4j_url, username=neo4j_user, password=neo4j_password)
 
-    hops = max(1, min(int(qc.expand_hops), 2))
-    limit = max(1, min(int(qc.max_graph_facts), 100))
-
-    seed_terms = [t.strip() for t in seed_terms if t and t.strip()][:3]
+    # Simple, safe query:
+    # - match nodes whose id contains a seed term
+    # - expand neighbors up to 1 hop (qc.expand_hops)
+    # - return triples as text facts
+    # Note: adjust labels/properties if your Neo4j schema differs.
+    seed_terms = [t for t in seed_terms if t.strip()]
     if not seed_terms:
         return ""
 
-    where = " OR ".join(
-        [f"toLower(coalesce(n.id,n.name,'')) CONTAINS toLower($t{i})" for i in range(len(seed_terms))]
-    )
+    # Build WHERE clause with OR
+    where = " OR ".join([f"toLower(n.id) CONTAINS toLower($t{i})" for i in range(len(seed_terms))])
     params = {f"t{i}": seed_terms[i] for i in range(len(seed_terms))}
 
+    # 1 hop expansion is stable and fast
     cypher = f"""
-    MATCH (n:Entity)
+    MATCH (n)
     WHERE {where}
-    MATCH p=(n)-[*1..{hops}]-(m:Entity)
-    WITH p LIMIT {limit}
-    WITH nodes(p) AS ns, relationships(p) AS rs
-    UNWIND range(0, size(rs)-1) AS i
-    RETURN DISTINCT
-      coalesce(ns[i].id, ns[i].name) AS head,
-      type(rs[i]) AS rel,
-      coalesce(ns[i+1].id, ns[i+1].name) AS tail
-    LIMIT {limit}
+    MATCH (n)-[r]->(m)
+    RETURN n.id AS head, type(r) AS rel, m.id AS tail
+    LIMIT {qc.max_graph_facts}
     """
 
     try:
@@ -134,35 +110,36 @@ def _fetch_graph_facts(
 
     facts = []
     for row in rows or []:
-        h, r, t = row.get("head"), row.get("rel"), row.get("tail")
+        h = row.get("head")
+        r = row.get("rel")
+        t = row.get("tail")
         if h and r and t:
-            facts.append(f"- [Graph Fact] {h} {r} {t}")
-
+            facts.append(f"- {h} {r} {t}")
     if not facts:
         return ""
+    return "# Graph Facts (Neo4j)\n" + "\n".join(facts)
 
-    return "# Graph Facts\n" + "\n".join(facts)
 
+def build_graphrag_context(
+    retrieved: List[RetrievedChunk],
+    qc: QueryConfig,
+    graph_facts_text: str = "",
+) -> str:
+    ctx = _format_chunks(retrieved, qc)
+    if graph_facts_text:
+        ctx = ctx + "\n\n" + graph_facts_text
+    return ctx
 
-# ==========================================================
-# Answer
-# ==========================================================
 
 def answer_query(
     llm: ChatGroq,
     question: str,
     context: str,
-    qc: QueryConfig,
 ) -> str:
     prompt = ANSWER_PROMPT.format(question=question, context=context)
     msg = llm.invoke([HumanMessage(content=prompt)])
-    out = msg.content if hasattr(msg, "content") else str(msg)
-    return _truncate(out, qc.answer_max_chars)
+    return msg.content if hasattr(msg, "content") else str(msg)
 
-
-# ==========================================================
-# Main Runner
-# ==========================================================
 
 def run_query(
     llm: ChatGroq,
@@ -173,69 +150,21 @@ def run_query(
     neo4j_user: Optional[str] = None,
     neo4j_password: Optional[str] = None,
     use_neo4j: bool = False,
-    cfg=None,
-    settings: Optional[Settings] = None,
 ) -> Tuple[str, List[RetrievedChunk], str]:
-    """
-    Preferred:
-      run_query(..., use_neo4j=True, settings=get_settings())
-
-    Legacy:
-      run_query(..., use_neo4j=True, neo4j_url=..., neo4j_user=..., neo4j_password=...)
-    """
     qc = qc or QueryConfig()
-    start = time.time()
 
-    retrieved = retrieve_chunks(
-        vstore,
-        question,
-        RetrieverConfig(
-            top_k=qc.top_k_chunks,
-            max_chunk_chars_each=qc.max_chunk_chars_each,
-        ),
-        cfg=cfg,  # kept for compatibility
-    )
-
-    # Build settings (prefer explicit Settings, else build from legacy params, else default)
-    if settings is None:
-        if neo4j_url and neo4j_user and neo4j_password:
-            base = get_settings()
-            settings = base.model_copy(
-                update={
-                    "NEO4J_URL": neo4j_url,
-                    "NEO4J_USER": neo4j_user,
-                    "NEO4J_PASSWORD": SecretStr(neo4j_password),
-                    # Don't force SYNC_NEO4J here; reading facts is separate.
-                }
-            )
-        else:
-            settings = get_settings()
+    retrieved = retrieve_chunks(vstore, question, qc)
 
     graph_facts = ""
-    if use_neo4j:
-        graph_facts = _fetch_graph_facts(settings, seed_terms=[question], qc=qc)
+    if use_neo4j and neo4j_url and neo4j_user is not None and neo4j_password is not None:
+        # seed terms from top chunks: cheap heuristic (first few capitalized words)
+        seeds = []
+        for ch in retrieved[:3]:
+            seeds.append(ch.chunk_id)  # not used in graph match
+        # better: use question keywords
+        seeds = [w for w in question.split() if len(w) >= 4][:6]
+        graph_facts = _fetch_graph_facts_from_neo4j(neo4j_url, neo4j_user, neo4j_password, seeds, qc)
 
-    context = build_context_md(
-        retrieved,
-        graph_facts_text=graph_facts,
-        cc=ContextConfig(
-            max_chunk_chars_each=qc.max_chunk_chars_each,
-            max_total_context_chars=qc.max_total_context_chars,
-            include_scores=True,
-            heading="Retrieved Chunks",
-        ),
-    )
-
-    answer = answer_query(llm, question, context, qc)
-
-    LOGGER.info(
-        "GraphRAG query complete",
-        extra={
-            "retrieved_chunks": len(retrieved),
-            "context_chars": len(context),
-            "latency_s": round(time.time() - start, 3),
-            "use_neo4j": bool(use_neo4j),
-        },
-    )
-
+    context = build_graphrag_context(retrieved, qc, graph_facts_text=graph_facts)
+    answer = answer_query(llm, question, context)
     return answer, retrieved, context
