@@ -1,16 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass
-import os 
- 
+
 @dataclass(frozen=True)
 class PipelineConfig:
     model_name: str = "llama-3.1-8b-instant"
     temperature: float = 0.0
-    #hard cap to avoid rate limits
     max_chunk_chars_for_llm: int = 6000
 
     chunk_strategy: str = "semantic"  # semantic | sections | sliding | pages
-    #for more accuracy ~100 for speed ~10
     max_total_chunks: int = 40
     prioritize_top_k: int = 28
 
@@ -19,7 +16,7 @@ class PipelineConfig:
     semantic_max_chunk_chars: int = 3400
     semantic_overlap_paragraphs: int = 1
     semantic_sim_threshold: float = 0.78
-    #max concurrent explain how many call requests to the LLM can be made at the same time ~1 slow
+
     max_concurrent_chunks: int = 6
     max_retries: int = 3
     retry_base_delay: float = 1.0
@@ -28,7 +25,6 @@ class PipelineConfig:
     max_direct_passes: int = 8
 
     sync_neo4j: bool = False
-    neo4j_url: str = os.getenv("NEO4J_URL", "")
-    neo4j_user: str =os.getenv("NEO4J_USER", "")
-    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "")
-
+    neo4j_url: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""

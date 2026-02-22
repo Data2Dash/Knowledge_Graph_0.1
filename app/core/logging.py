@@ -1,30 +1,28 @@
-import logging
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 
-def setup_logging(name: str = "data2dash") -> logging.Logger:
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
+def setup_logging():
+    log_dir = os.path.join("output", "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
-    logger = logging.getLogger(name)
+    log_path = os.path.join(log_dir, "debug.log")
 
-    if logger.handlers:
-        return logger  # prevent duplicate logs
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
 
-    logger.setLevel(level)
+    if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(log_path)
+               for h in root.handlers):
 
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    )
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=2_000_000,   # 2MB
+            backupCount=5,
+            encoding="utf-8"
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
 
-    # console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+        root.addHandler(file_handler)
 
-    # file handler (VERY important in production)
-    fh = logging.FileHandler("data2dash.log")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    return logger
-
-###LOG_LEVEL=DEBUG
+setup_logging()

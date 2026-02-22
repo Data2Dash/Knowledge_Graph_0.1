@@ -3,39 +3,13 @@ from typing import List
 from app.knowledge_graph.chunking.semantic_chunker import Chunk
 
 PRIORITY_KEYWORDS = [
-
-    # Core research signals
-    "method", "approach", "architecture", "model", "framework",
-    "system", "pipeline", "algorithm", "technique",
-
-    # Training / learning
-    "trained", "training", "fine-tuned", "pretrained",
-    "optimization", "objective", "loss", "inference",
-
-    # Data
-    "dataset", "corpus", "benchmark", "annotations", "samples",
-
-    # Evaluation
-    "evaluation", "metric", "accuracy", "precision", "recall",
-    "f1", "bleu", "roc", "auc", "performance",
-
-    # Comparison
-    "baseline", "comparison", "compared", "outperforms",
-    "improves", "improvement", "gain", "state-of-the-art", "sota",
-
-    # Model internals
-    "encoder", "decoder", "attention", "layer",
-    "embedding", "representation", "feature",
-
-    # Contribution signals
-    "proposed", "introduces", "contribution",
-    "extends", "based on", "leverages", "incorporates",
-
-    # Research diagnostics
-    "ablation", "limitation", "challenge",
-    "hyperparameter", "constraint"
+    "method", "architecture", "model", "transformer", "attention",
+    "experiment", "results", "evaluation", "dataset", "benchmark",
+    "training", "loss", "approach", "encoder", "decoder",
+    "proposed", "compared", "achieves", "outperforms",
+    "baseline", "metric", "accuracy", "f1", "bleu",
+    "ablation", "limitation", "hyperparameter", "contribution"
 ]
-
 
 def rank_chunks(chunks: List[Chunk]) -> List[Chunk]:
     scored = []

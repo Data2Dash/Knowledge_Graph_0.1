@@ -21,6 +21,7 @@ from app.knowledge_graph.preprocessing.text_cleaner import (
 )
 
 from app.knowledge_graph.chunking.semantic_chunker import semantic_chunk, Chunk
+from app.knowledge_graph.chunking.custom_chunker import custom_chunk
 from app.knowledge_graph.chunking.chunk_ranker import rank_chunks
 
 from app.knowledge_graph.extraction.async_runner import run_bounded
@@ -32,7 +33,9 @@ from app.knowledge_graph.postprocess.cleaner import clean_entities_relations
 from app.knowledge_graph.store.vector_store import InMemoryVectorStore
 from app.knowledge_graph.store.neo4j_store import sync_graph_documents
 
-LOGGER = setup_logging("data2dash.pipeline")
+import logging
+setup_logging()  # configure handlers once
+LOGGER = logging.getLogger("data2dash.pipeline")
 
 _ONLY_NUMBER = re.compile(r"^\d+(\.\d+)?$")
 
@@ -61,12 +64,29 @@ def _build_chunks(text: str, cfg: PipelineConfig) -> List[Chunk]:
 
     if strat == "semantic":
         chunks = semantic_chunk(text, cfg)
+
+    elif strat == "custom":
+        # Uses your --- Page N --- markers + regex headings + paragraph windows
+        target_words = getattr(cfg, "target_chunk_words", 900)
+        overlap_words = getattr(cfg, "chunk_overlap_words", 150)
+        drop_refs = getattr(cfg, "drop_references", True)
+
+        chunks = custom_chunk(
+            text_with_page_markers=text,
+            target_words=target_words,
+            overlap_words=overlap_words,
+            drop_references=drop_refs,
+        )
+
     elif strat == "sections":
         chunks = [Chunk(str(i + 1), c) for i, c in enumerate(split_by_sections(text, 2600, 900))]
+
     elif strat == "sliding":
         chunks = [Chunk(str(i + 1), c) for i, c in enumerate(sliding_window_chunks(text, 2400, 700, 40))]
+
     elif strat == "pages":
         chunks = [Chunk(str(i + 1), c) for i, c in enumerate(page_based_chunks(text, 120))]
+
     else:
         chunks = [Chunk(str(i + 1), c) for i, c in enumerate(_chunks_fallback(text, cfg))]
 

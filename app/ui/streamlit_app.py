@@ -14,28 +14,32 @@ from app.knowledge_graph.graph_rag.query_engine import run_query, QueryConfig
 from app.knowledge_graph.llm.groq_client import build_llm
 
 
+def _init_state() -> None:
+    defaults = {
+        "vstore": None,
+        "graph_docs": None,
+        "cfg": None,
+        "last_html": None,
+        "sync_status": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
 def run_app():
     st.set_page_config(
         page_title="Data2Dash – Knowledge Graph Extractor",
         page_icon="📊",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
     )
 
-    # ---------- Session state ----------
-    if "vstore" not in st.session_state:
-        st.session_state.vstore = None
-    if "graph_docs" not in st.session_state:
-        st.session_state.graph_docs = None
-    if "cfg" not in st.session_state:
-        st.session_state.cfg = None
-    if "last_html" not in st.session_state:
-        st.session_state.last_html = None
-    if "sync_status" not in st.session_state:
-        st.session_state.sync_status = None
+    _init_state()
 
     # ---------------- Custom CSS ----------------
-    st.markdown("""
+    st.markdown(
+        """
         <style>
         .main { background-color: #f8f9fa; color: #212529; }
         .stButton>button {
@@ -53,7 +57,9 @@ def run_app():
         h1 { color: #1a1c23; font-family: 'Inter', sans-serif; font-weight: 700; }
         [data-testid="stAppViewContainer"] .main .block-container { padding-top: 1.5rem; }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
     # ---------------- Main Header ----------------
     st.title("📊 Data2Dash")
@@ -64,18 +70,36 @@ def run_app():
     st.sidebar.title("Data2Dash")
     st.sidebar.caption("Configuration")
 
-    input_method = st.sidebar.selectbox("Select Input Source:", ["📄 Upload PDF/TXT", "✍️ Manual Text Input"])
+    input_method = st.sidebar.selectbox(
+        "Select Input Source:",
+        ["📄 Upload PDF/TXT", "✍️ Manual Text Input"],
+    )
     st.sidebar.divider()
 
-    # ---------- Performance / Quality knobs ----------
+    # NOTE: Inside sidebar expander, use st.<widget> (not st.sidebar.<widget>)
+    # otherwise widgets can appear outside the expander in some Streamlit versions. :contentReference[oaicite:2]{index=2}
     with st.sidebar.expander("⚙️ Extraction Settings", expanded=False):
-        chunk_strategy = st.selectbox("Chunk Strategy", ["semantic", "sections", "sliding", "pages"], index=0)
+        chunk_strategy = st.selectbox(
+            "Chunk Strategy",
+            ["custom", "semantic", "sections", "sliding", "pages"],
+            index=0,
+            help="custom = page markers + regex headings + paragraph windows",
+        )
         max_chunks = st.slider("Max chunks (cost control)", 10, 60, 40, 2)
         top_k = st.slider("Top prioritized chunks", 10, 60, 28, 2)
         concurrency = st.slider("Concurrency (rate-limit risk)", 1, 12, 6, 1)
         min_rels = st.slider("Min relations target", 10, 80, 35, 1)
 
+        # Optional knobs for custom chunker (safe even if PipelineConfig ignores them)
+        if chunk_strategy == "custom":
+            target_words = st.slider("Target words per chunk", 400, 1600, 900, 50)
+            overlap_words = st.slider("Overlap words", 0, 400, 150, 10)
+            drop_refs = st.checkbox("Drop References section", value=True)
+        else:
+            target_words, overlap_words, drop_refs = 900, 150, True
+
     # ---------- Neo4j ----------
+    st.sidebar.divider()
     sync_neo4j = st.sidebar.checkbox("🔗 Sync to Neo4j Database", value=False)
     neo4j_url = neo4j_user = neo4j_pass = None
     if sync_neo4j:
@@ -125,6 +149,15 @@ def run_app():
             neo4j_password=neo4j_pass or "",
         )
 
+        # These are optional; only used if your PipelineConfig supports them
+        # (won't crash if PipelineConfig ignores unknown attributes)
+        try:
+            cfg.target_chunk_words = target_words
+            cfg.chunk_overlap_words = overlap_words
+            cfg.drop_references = drop_refs
+        except Exception:
+            pass
+
         st.session_state.cfg = cfg
 
         with st.spinner("🧠 Extracting entities + relations (2-pass) ..."):
@@ -139,13 +172,13 @@ def run_app():
                 st.success(f"✨ Knowledge graph generated with {node_count} nodes and {rel_count} relationships!")
 
                 if sync_neo4j:
-                    if sync_status:
-                        st.info("✅ Successfully synced to Neo4j.")
-                    else:
-                        st.warning("⚠️ Neo4j sync failed.")
+                    st.info("✅ Successfully synced to Neo4j." if sync_status else "⚠️ Neo4j sync failed.")
 
                 run_id = str(int(time.time()))
-                html_path = f"knowledge_graph_{run_id}.html"
+                output_dir = os.path.join("output", "graphs")
+                os.makedirs(output_dir, exist_ok=True)
+
+                html_path = os.path.join(output_dir, f"knowledge_graph_{run_id}.html")
                 outpath = visualize_graph(graph_docs, output_file=html_path)
                 st.session_state.last_html = outpath
 
@@ -160,8 +193,10 @@ def run_app():
 
     # ---------------- Show Graph if exists ----------------
     if st.session_state.last_html and os.path.exists(st.session_state.last_html):
+        # Showing saved HTML via components.html is a standard pattern. :contentReference[oaicite:3]{index=3}
         with open(st.session_state.last_html, "r", encoding="utf-8", errors="ignore") as f:
             components.html(f.read(), height=800, scrolling=True)
+
         with open(st.session_state.last_html, "rb") as f:
             st.download_button(
                 "📥 Download HTML Graph",
@@ -182,7 +217,7 @@ def run_app():
 
     question = st.text_input(
         "Ask a question about the paper:",
-        placeholder="e.g., What dataset did the model train on and what metric improved?"
+        placeholder="e.g., What dataset did the model train on and what metric improved?",
     )
 
     use_neo = st.checkbox("Use Neo4j graph facts (if synced)", value=False)
