@@ -24,9 +24,9 @@ Data2Dash GraphRAG Engine transforms unstructured research papers into structure
 
 PDF / Text
 ↓
-Preprocessing
+Preprocessing 
 ↓
-Semantic Chunking
+Semantic Chunking / custom chunking
 ↓
 LLM Extraction (Entities → Relations)
 ↓

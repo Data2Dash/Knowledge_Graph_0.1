@@ -7,7 +7,7 @@ def visualize_graph(graph_documents: List[GraphDocument], output_file: str = "kn
     if not graph_documents:
         return None
     g = graph_documents[0]
-    net = Network(height="900px", width="100%", directed=True, bgcolor="#ffffff", font_color="#222")
+    net = Network(height="900px", width="100%", directed=True, bgcolor="#ffffff", font_color="#222222")
 
     for n in g.nodes:
         net.add_node(n.id, label=n.id, title=getattr(n, "type", "Concept"), color="#b9d9ea")

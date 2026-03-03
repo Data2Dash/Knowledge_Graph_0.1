@@ -1,34 +1,18 @@
-RESEARCH_PAPER_ENTITY_PROMPT = """\
-You extract ENTITIES from research papers.
-Return ONLY valid JSON array (no markdown).
-Each item:
-{"name": "...", "type": "...", "aliases": ["..."]}
+JOINT_EXTRACTION_PROMPT = """\
+You are an expert Ontologist. Your task is to perform Joint Entity-Relation Extraction.
 
-Types must be one of:
-Concept, Method, Model, Dataset, Metric, Result, Baseline, Technique, Architecture,
-Task, Algorithm, Benchmark, Component, Observation, Limitation, Contribution,
-Author, Organization, Publication, System, Process, Theory, Hyperparameter
+Instructions:
 
-Rules:
-- Prefer specific names (e.g., "BERT", "CIFAR-10", "BLEU", "LoRA").
-- Include aliases if present (acronyms).
-- Output 15-60 entities when possible.
-"""
+Identify scientific entities (Model, Method, Metric, Baseline) and their interactions.
 
-RESEARCH_PAPER_RELATION_PROMPT = """\
-You extract RELATIONSHIPS from research papers using a provided entity list.
-Return ONLY valid JSON array (no markdown).
-Each item:
-{"head":"...", "head_type":"...", "relation":"...", "tail":"...", "tail_type":"...", "evidence":"..."}
+Evidence Requirement: For every relation, extract the exact supporting sentence.
 
-Allowed relations:
-RELATED_TO, USES, CONTAINS, PART_OF, COMPARED_TO, TRAINED_ON, EVALUATES, IMPROVES,
-IMPLEMENTS, ACHIEVES, ADDRESSES, RESULTS_IN, PROPOSES, EXTENDS, DEPENDS_ON,
-SUPPORTS, ILLUSTRATES, CONTRIBUTES_TO, INTRODUCES, OBSERVED_IN, LIMITS, CITES,
-DESCRIBED_IN
+Formatting: Output strictly valid JSON. Do not include markdown ticks.
 
-Rules:
-- Use ONLY entities from the entity list (or obvious exact matches).
-- evidence must be a short quote (<= 25 words) copied from the text.
-- Output 20-70 relations when possible.
-"""
+JSON Schema:
+{
+  "entities": [{"id": "unique_slug", "type": "OntologyType", "desc": "brief definition"}],
+  "relations": [{"source": "id1", "target": "id2", "predicate": "USES|IMPROVES|CONTRASTS", "evidence": "Exact quote"}]
+}
+
+Text to Process: {{text_chunk}}"""

@@ -41,7 +41,7 @@ def run_app():
     st.markdown(
         """
         <style>
-        .main { background-color: #f8f9fa; color: #212529; }
+        .main { background-color: #0e1117; color: #fafafa; }
         .stButton>button {
             width: 100%; border-radius: 8px; height: 3.5em;
             background-color: #4b6cb7; color: white; font-weight: 600; border: none;
@@ -54,7 +54,8 @@ def run_app():
         .stSidebar [data-testid="stMarkdownContainer"] p { color: #ffffff !important; }
         .stSidebar h1, .stSidebar h2, .stSidebar h3, .stSidebar label { color: #ffffff !important; }
         .stSidebar .stSelectbox label, .stSidebar .stRadio label, .stSidebar .stCheckbox label { color: #ffffff !important; }
-        h1 { color: #1a1c23; font-family: 'Inter', sans-serif; font-weight: 700; }
+        h1, h2, h3, h4, h5, h6 { color: #ffffff !important; font-family: 'Inter', sans-serif; font-weight: 700; }
+        p, label { color: #fafafa; }
         [data-testid="stAppViewContainer"] .main .block-container { padding-top: 1.5rem; }
         </style>
         """,
@@ -160,7 +161,7 @@ def run_app():
 
         st.session_state.cfg = cfg
 
-        with st.spinner("🧠 Extracting entities + relations (2-pass) ..."):
+        with st.spinner("🧠 Extracting semantic network (Joint Extraction) ..."):
             try:
                 vstore, graph_docs, sync_status = generate_knowledge_graph(source, is_path=is_path, cfg=cfg)
                 st.session_state.vstore = vstore
@@ -233,31 +234,32 @@ def run_app():
         vstore = st.session_state.vstore
 
         try:
-            llm = build_llm(cfg)
-            qc = QueryConfig(top_k_chunks=topk, max_chunk_chars_each=max_chars)
-
-            answer, retrieved, context = run_query(
-                llm=llm,
-                vstore=vstore,
-                question=question,
-                qc=qc,
-                neo4j_url=cfg.neo4j_url,
-                neo4j_user=cfg.neo4j_user,
-                neo4j_password=cfg.neo4j_password,
-                use_neo4j=use_neo,
-            )
-
-            st.markdown("### ✅ Answer")
-            st.write(answer)
-
-            with st.expander("📎 Retrieved Evidence"):
-                for ch in retrieved:
-                    st.markdown(f"**Chunk {ch.chunk_id}** (score={ch.score:.3f})")
-                    st.write(ch.text[:1500] + ("..." if len(ch.text) > 1500 else ""))
-
-            with st.expander("🧱 Full Context sent to the LLM"):
-                st.code(context)
-
+            with st.spinner("Hybrid GraphRAG searching..."):
+                llm = build_llm(cfg)
+                qc = QueryConfig(top_k_chunks=topk, max_chunk_chars_each=max_chars)
+    
+                answer, retrieved, context = run_query(
+                    llm=llm,
+                    vstore=vstore,
+                    question=question,
+                    qc=qc,
+                    neo4j_url=cfg.neo4j_url,
+                    neo4j_user=cfg.neo4j_user,
+                    neo4j_password=cfg.neo4j_password,
+                    use_neo4j=use_neo,
+                )
+    
+                st.markdown("### ✅ Answer")
+                st.write(answer)
+    
+                with st.expander("📎 Retrieved Evidence"):
+                    for ctx in retrieved:
+                        st.markdown(f"**{ctx.id}** (Source: {ctx.source_type} | score={ctx.score:.3f})")
+                        st.write(ctx.text[:1500] + ("..." if len(ctx.text) > 1500 else ""))
+    
+                with st.expander("🧱 Full Context sent to the LLM"):
+                    st.code(context)
+    
         except Exception as e:
             st.error(f"❌ Query Error: {e}")
 
