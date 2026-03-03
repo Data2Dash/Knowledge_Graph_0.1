@@ -25,8 +25,7 @@ from app.knowledge_graph.chunking.custom_chunker import custom_chunk
 from app.knowledge_graph.chunking.chunk_ranker import rank_chunks
 
 from app.knowledge_graph.extraction.async_runner import run_bounded
-from app.knowledge_graph.extraction.entity_extractor import extract_entities
-from app.knowledge_graph.extraction.relation_extractor import extract_relations
+from app.knowledge_graph.extraction.joint_extractor import extract_jointly
 from app.knowledge_graph.extraction.schema import Entity, Relation
 from app.knowledge_graph.postprocess.cleaner import clean_entities_relations
 
@@ -177,9 +176,7 @@ def _build_nodes_and_edges(
 
 
 async def _extract_for_chunk(llm, text: str, cfg: PipelineConfig) -> Tuple[List[Entity], List[Relation]]:
-    ents = extract_entities(llm, text, cfg.max_chunk_chars_for_llm)
-    rels = extract_relations(llm, text, ents, cfg.max_chunk_chars_for_llm)
-    return ents, rels
+    return extract_jointly(llm, text, cfg.max_chunk_chars_for_llm)
 
 
 def run_async(coro):
