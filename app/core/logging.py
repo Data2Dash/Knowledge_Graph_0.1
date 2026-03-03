@@ -3,7 +3,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 def setup_logging():
-    log_dir = os.path.join("output", "logs")
+    log_dir = os.path.join("outputs", "logs")
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, "debug.log")
