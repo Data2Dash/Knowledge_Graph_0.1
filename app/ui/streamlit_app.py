@@ -176,7 +176,7 @@ def run_app():
                     st.info("✅ Successfully synced to Neo4j." if sync_status else "⚠️ Neo4j sync failed.")
 
                 run_id = str(int(time.time()))
-                output_dir = os.path.join("output", "graphs")
+                output_dir = os.path.join("outputs", "graphs")
                 os.makedirs(output_dir, exist_ok=True)
 
                 html_path = os.path.join(output_dir, f"knowledge_graph_{run_id}.html")
